@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <stdexcept>
 #include <thread>
 #include <xmmintrin.h>
 #ifdef _WIN32
@@ -24,6 +25,8 @@ std::int32_t APS5_VABI sceFiberGetThreadFramePointerAddress(std::uint64_t*);
 std::int32_t APS5_VABI _sceFiberGetThreadFramePointerAddress(std::uint64_t*);
 std::int32_t APS5_VABI sceFiberStartContextSizeCheck(std::uint32_t);
 std::int32_t APS5_VABI sceFiberStopContextSizeCheck(void);
+int APS5_VABI _sceFiberAttachContextAndRun(FiberObject*, void*, std::uint64_t, std::uint64_t, std::uint64_t*);
+int APS5_VABI _sceFiberAttachContextAndSwitch(FiberObject*, void*, std::uint64_t, std::uint64_t, std::uint64_t*);
 }
 
 static void Require(bool value, const char* what) {
@@ -33,6 +36,8 @@ static void Require(bool value, const char* what) {
 namespace {
 
 constexpr std::int32_t FiberErrorNull = static_cast<std::int32_t>(0x80590001);
+constexpr std::int32_t FiberErrorAlignment = static_cast<std::int32_t>(0x80590002);
+constexpr std::int32_t FiberErrorRange = static_cast<std::int32_t>(0x80590003);
 constexpr std::int32_t FiberErrorInvalid = static_cast<std::int32_t>(0x80590004);
 constexpr std::int32_t FiberErrorPermission = static_cast<std::int32_t>(0x80590005);
 constexpr std::int32_t FiberErrorState = static_cast<std::int32_t>(0x80590006);
@@ -235,6 +240,61 @@ void RunOnLargeContext() {
     Require(sceFiberFinalize(fiber) == 0, "finalize large fiber");
 }
 
+alignas(16) std::array<unsigned char, 64 * 1024> g_attachedContext;
+alignas(16) std::array<unsigned char, 16 * 1024> g_attachedPeerContext;
+FiberStorage g_attachedStorage;
+FiberStorage g_attachedPeerStorage;
+auto* const g_attached = reinterpret_cast<FiberObject*>(&g_attachedStorage);
+auto* const g_attachedPeer = reinterpret_cast<FiberObject*>(&g_attachedPeerStorage);
+
+void APS5_VABI AttachedPeerEntry(std::uint64_t argOnInitialize, std::uint64_t argOnRun) {
+    Require(argOnInitialize == 2 && argOnRun == 9, "attached peer arguments");
+    CheckActiveContext(g_attachedPeer, g_attachedPeerContext.size());
+    Require(sceFiberSwitch(g_attached, 10, nullptr) == 0, "switch back from the attached peer");
+    Require(false, "attached peer resumed after its last switch");
+}
+
+void APS5_VABI AttachedEntry(std::uint64_t argOnInitialize, std::uint64_t argOnRun) {
+    Require(argOnInitialize == 1 && argOnRun == 7, "attached fiber arguments");
+    CheckActiveContext(g_attached, g_attachedContext.size());
+    Require(_sceFiberAttachContextAndRun(g_attachedPeer, g_attachedPeerContext.data(), g_attachedPeerContext.size(), 0, nullptr) == FiberErrorPermission, "attach and run inside a fiber");
+    std::uint64_t received = 0;
+    Require(_sceFiberAttachContextAndSwitch(g_attachedPeer, g_attachedPeerContext.data(), g_attachedPeerContext.size(), 9, &received) == 0, "attach and switch");
+    Require(received == 10, "switch back to the attached fiber");
+    CheckActiveContext(g_attached, g_attachedContext.size());
+    received = 41;
+    for (;;) Require(sceFiberReturnToThread(received + 1, &received) == 0, "attached fiber return");
+}
+
+void RunAttachedContexts() {
+    std::uint64_t returned = 0;
+    FiberInfo info{};
+    info.size = sizeof(info);
+    Require(_sceFiberInitializeImpl_nid_postfix(g_attached, "attached", AttachedEntry, 1, nullptr, 0x1000, nullptr, 0) == FiberErrorInvalid, "size without a context");
+    Require(_sceFiberInitializeImpl_nid_postfix(g_attached, "attached", AttachedEntry, 1, nullptr, 0, nullptr, 0) == 0, "initialize without a context");
+    Require(_sceFiberInitializeImpl_nid_postfix(g_attachedPeer, "attached peer", AttachedPeerEntry, 2, nullptr, 0, nullptr, 0) == 0, "initialize peer without a context");
+    Require(sceFiberGetInfo(g_attached, &info) == 0 && info.addr_context == nullptr && info.size_context == 0, "no context reported");
+    bool threw = false;
+    try {
+        sceFiberRun_nid_postfix(g_attached, 0, nullptr);
+    } catch (const std::runtime_error&) {
+        threw = true;
+    }
+    Require(threw, "running without a context throws");
+    Require(_sceFiberAttachContextAndSwitch(g_attached, g_attachedContext.data(), g_attachedContext.size(), 0, nullptr) == FiberErrorPermission, "attach and switch outside a fiber");
+    Require(_sceFiberAttachContextAndRun(nullptr, g_attachedContext.data(), g_attachedContext.size(), 0, nullptr) == FiberErrorNull, "attach to a null fiber");
+    Require(_sceFiberAttachContextAndRun(g_attached, g_attachedContext.data() + 8, 0x1000, 0, nullptr) == FiberErrorAlignment, "attach a misaligned context");
+    Require(_sceFiberAttachContextAndRun(g_attached, g_attachedContext.data(), 256, 0, nullptr) == FiberErrorRange, "attach a short context");
+    Require(_sceFiberAttachContextAndRun(g_attached, g_attachedContext.data(), 0x1008, 0, nullptr) == FiberErrorInvalid, "attach an unaligned size");
+    Require(_sceFiberAttachContextAndRun(g_attached, nullptr, 0x1000, 0, nullptr) == FiberErrorInvalid, "attach a size without a context");
+    Require(_sceFiberAttachContextAndRun(g_attached, g_attachedContext.data(), g_attachedContext.size(), 7, &returned) == 0 && returned == 42, "attach and run");
+    Require(_sceFiberAttachContextAndRun(g_attached, g_attachedContext.data(), g_attachedContext.size(), 0, nullptr) == FiberErrorInvalid, "attach a second context");
+    Require(_sceFiberAttachContextAndRun(g_attached, nullptr, 0, 50, &returned) == 0 && returned == 51, "run without attaching");
+    Require(sceFiberGetInfo(g_attached, &info) == 0 && info.size_context == g_attachedContext.size(), "attached context reported");
+    Require(sceFiberFinalize(g_attached) == 0, "finalize attached");
+    Require(sceFiberFinalize(g_attachedPeer) == 0, "finalize attached peer");
+}
+
 [[gnu::noinline]] std::int32_t RunFirst(std::uint64_t* returned) {
     g_threadFramePointer = reinterpret_cast<std::uint64_t>(__builtin_frame_address(0));
     const std::int32_t result = sceFiberRun_nid_postfix(g_first, 100, returned);
@@ -285,4 +345,5 @@ int main() {
     RunHostCallOnSmallContext();
     RunFrameChain();
     RunOnLargeContext();
+    RunAttachedContexts();
 }

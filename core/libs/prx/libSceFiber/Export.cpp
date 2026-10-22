@@ -389,6 +389,41 @@ static bool AcquireForResume(Fiber* target) {
     }
 }
 
+static void SetContext(Fiber* fiber, void* addr_context, std::uint64_t size_context) {
+    fiber->context = static_cast<std::uint8_t*>(addr_context);
+    fiber->contextSize = size_context;
+    if (size_context < FIBER_GUEST_STACK_MIN) AllocateHostStack(fiber);
+    if (fiber->contextSizeCheck) {
+        auto* words = SizedWindow(fiber);
+        std::fill(words, words + size_context / sizeof(std::uint64_t), FIBER_CONTEXT_FILL);
+    }
+    PinStack(addr_context, size_context);
+}
+
+static void ReleaseContext(Fiber* fiber) {
+    if (!fiber->context) return;
+    UnpinStack(fiber->context, fiber->contextSize);
+    ReleaseHostStack(fiber);
+}
+
+static void RequireContext(const Fiber* fiber, const char* function) {
+    if (!fiber->context)
+        throw std::runtime_error(std::string(function) + ": running fiber '" + fiber->name + "', which has no context, on the caller's stack is not implemented");
+}
+
+static int32_t AttachContext(Fiber* fiber, void* addr_context, std::uint64_t size_context) {
+    if (size_context != 0 && size_context < FIBER_MIN_CONTEXT_SIZE) return SCE_FIBER_ERROR_RANGE;
+    if ((size_context & 15) != 0 || addr_context == nullptr || size_context == 0 || fiber->context) return SCE_FIBER_ERROR_INVALID;
+    SetContext(fiber, addr_context, size_context);
+    return SCE_OK;
+}
+
+static int32_t CheckAttach(FiberObject* object, void* addr_context) {
+    if (!object) return SCE_FIBER_ERROR_NULL;
+    if ((reinterpret_cast<std::uintptr_t>(object) & 7) != 0 || (reinterpret_cast<std::uintptr_t>(addr_context) & 15) != 0) return SCE_FIBER_ERROR_ALIGNMENT;
+    return AsFiber(object) ? SCE_OK : SCE_FIBER_ERROR_INVALID;
+}
+
 static void Resume(Fiber* target, void** save, std::uint64_t argOnRun) {
     const auto* frame = static_cast<const InitialFrame*>(target->savedStack);
     if (frame->returnAddress == 0) {
@@ -414,28 +449,17 @@ int32_t APS5_VABI _sceFiberInitializeImpl_nid_postfix(FiberObject* object, const
     if ((reinterpret_cast<std::uintptr_t>(object) & 7) != 0) return SCE_FIBER_ERROR_ALIGNMENT;
     if (addr_context == nullptr && size_context != 0) return SCE_FIBER_ERROR_INVALID;
     if ((reinterpret_cast<std::uintptr_t>(addr_context) & 15) != 0 || (size_context & 15) != 0) return SCE_FIBER_ERROR_ALIGNMENT;
-    if (addr_context == nullptr) return SCE_FIBER_ERROR_INVALID;
-    if (size_context < FIBER_MIN_CONTEXT_SIZE) return SCE_FIBER_ERROR_RANGE;
+    if (addr_context != nullptr && size_context < FIBER_MIN_CONTEXT_SIZE) return SCE_FIBER_ERROR_RANGE;
     auto* fiber = reinterpret_cast<Fiber*>(object);
-    if (fiber->magic == FIBER_MAGIC) {
-        UnpinStack(fiber->context, fiber->contextSize);
-        ReleaseHostStack(fiber);
-    }
+    if (fiber->magic == FIBER_MAGIC) ReleaseContext(fiber);
     std::memset(object, 0, FIBER_OBJECT_SIZE);
     fiber->magic = FIBER_MAGIC;
     fiber->state.store(FiberState::Idle, std::memory_order_relaxed);
     fiber->entry = entry;
     fiber->argOnInitialize = arg_on_initialize;
-    fiber->context = static_cast<std::uint8_t*>(addr_context);
-    fiber->contextSize = size_context;
     std::strncpy(fiber->name, name, FIBER_MAX_NAME_LENGTH);
-    if (size_context < FIBER_GUEST_STACK_MIN) AllocateHostStack(fiber);
     fiber->contextSizeCheck = g_contextSizeCheck.load(std::memory_order_relaxed);
-    if (fiber->contextSizeCheck) {
-        auto* words = SizedWindow(fiber);
-        std::fill(words, words + size_context / sizeof(std::uint64_t), FIBER_CONTEXT_FILL);
-    }
-    PinStack(addr_context, size_context);
+    if (addr_context) SetContext(fiber, addr_context, size_context);
     if (TraceFibers()) std::fprintf(stderr, "[fiber] init %s object=%p context=%p+0x%llx entry=%p\n", fiber->name, static_cast<void*>(object), addr_context, static_cast<unsigned long long>(size_context), reinterpret_cast<void*>(entry));
     return SCE_OK;
 }
@@ -446,8 +470,7 @@ int32_t APS5_VABI sceFiberFinalize(FiberObject* object) {
     const auto state = fiber->state.load(std::memory_order_acquire);
     if (state == FiberState::Running || state == FiberState::Suspending) return SCE_FIBER_ERROR_STATE;
     fiber->magic = 0;
-    UnpinStack(fiber->context, fiber->contextSize);
-    ReleaseHostStack(fiber);
+    ReleaseContext(fiber);
     return SCE_OK;
 }
 
@@ -455,6 +478,7 @@ int32_t APS5_VABI sceFiberRun_nid_postfix(FiberObject* object, uint64_t arg_on_r
     auto* fiber = AsFiber(object);
     if (!fiber) return object ? SCE_FIBER_ERROR_INVALID : SCE_FIBER_ERROR_NULL;
     if (ThreadState().current) return SCE_FIBER_ERROR_PERMISSION;
+    RequireContext(fiber, "sceFiberRun");
     if (!AcquireForResume(fiber)) return SCE_FIBER_ERROR_STATE;
     ThreadState().threadFramePointer = reinterpret_cast<std::uint64_t>(static_cast<void**>(__builtin_frame_address(0))[0]);
     ThreadState().threadBounds = CurrentBounds();
@@ -470,7 +494,9 @@ int32_t APS5_VABI sceFiberSwitch(FiberObject* object, uint64_t arg_on_run, uint6
     if (!target) return object ? SCE_FIBER_ERROR_INVALID : SCE_FIBER_ERROR_NULL;
     auto* self = ThreadState().current;
     if (!self) return SCE_FIBER_ERROR_PERMISSION;
-    if (target == self || !AcquireForResume(target)) return SCE_FIBER_ERROR_STATE;
+    if (target == self) return SCE_FIBER_ERROR_STATE;
+    RequireContext(target, "sceFiberSwitch");
+    if (!AcquireForResume(target)) return SCE_FIBER_ERROR_STATE;
     if (TraceFibers()) {
         auto** frame = static_cast<void**>(__builtin_frame_address(0));
         void* chain[6] = {};
@@ -521,7 +547,7 @@ int32_t APS5_VABI sceFiberGetInfo(FiberObject* object, FiberInfo* fiber_info) {
     fiber_info->size_context = fiber->contextSize;
     std::memcpy(fiber_info->name, fiber->name, sizeof(fiber_info->name));
     fiber_info->size_context_margin = static_cast<uint64_t>(-1);
-    if (fiber->contextSizeCheck) {
+    if (fiber->contextSizeCheck && fiber->context) {
         const auto* words = SizedWindow(fiber);
         const auto* end = words + fiber->contextSize / sizeof(std::uint64_t);
         fiber_info->size_context_margin = static_cast<uint64_t>(std::find_if(words, end, [](std::uint64_t word) { return word != FIBER_CONTEXT_FILL; }) - words) * sizeof(std::uint64_t);
@@ -567,14 +593,20 @@ int32_t APS5_VABI sceFiberStopContextSizeCheck(void) {
 
 int APS5_VABI _sceFiberAttachContextAndRun(FiberObject* fiber, void* addr_context, uint64_t size_context,
                                           uint64_t arg_on_run, uint64_t* arg_on_return) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
+    if (const int32_t error = CheckAttach(fiber, addr_context)) return error;
+    if (ThreadState().current) return SCE_FIBER_ERROR_PERMISSION;
+    if (addr_context || size_context)
+        if (const int32_t error = AttachContext(AsFiber(fiber), addr_context, size_context)) return error;
+    return sceFiberRun_nid_postfix(fiber, arg_on_run, arg_on_return);
 }
 
 int APS5_VABI _sceFiberAttachContextAndSwitch(FiberObject* fiber, void* addr_context, uint64_t size_context,
                                               uint64_t arg_on_run, uint64_t* arg_on_run_out) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
+    if (const int32_t error = CheckAttach(fiber, addr_context)) return error;
+    if (!ThreadState().current) return SCE_FIBER_ERROR_PERMISSION;
+    if (addr_context || size_context)
+        if (const int32_t error = AttachContext(AsFiber(fiber), addr_context, size_context)) return error;
+    return sceFiberSwitch(fiber, arg_on_run, arg_on_run_out);
 }
 
 int APS5_VABI _sceFiberInitializeWithInternalOptionImpl(FiberObject* fiber, const char* name, GuestFiberEntry entry,
